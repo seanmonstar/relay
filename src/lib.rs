@@ -83,7 +83,7 @@ impl<T> Drop for Sender<T> {
             borrow.rx_task.take()
         };
         if let Some(task) = rx_task {
-            task.unpark();
+            task.notify();
         }
     }
 }
@@ -120,9 +120,9 @@ impl<T> Future for Receiver<T> {
         } else if borrow.complete {
             Err(Canceled)
         } else {
-            borrow.rx_task = Some(task::park());
+            borrow.rx_task = Some(task::current());
             if let Some(task) = borrow.tx_task.take() {
-                task.unpark();
+                task.notify();
             }
             Ok(Async::NotReady)
         }
@@ -138,7 +138,7 @@ impl<T> Drop for Receiver<T> {
             borrow.tx_task.take()
         };
         if let Some(task) = tx_task {
-            task.unpark();
+            task.notify();
         }
     }
 }
@@ -164,7 +164,7 @@ impl<T> Future for Waiting<T> {
         } else if self.tx.as_ref().unwrap().inner.borrow().rx_task.is_some() {
             Ok(Async::Ready(self.tx.take().unwrap()))
         } else {
-            self.tx.as_ref().unwrap().inner.borrow_mut().tx_task = Some(task::park());
+            self.tx.as_ref().unwrap().inner.borrow_mut().tx_task = Some(task::current());
             Ok(Async::NotReady)
         }
     }
