@@ -41,7 +41,7 @@ pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
         rx_task: None,
     }));
     let tx = Sender {
-        inner: inner.clone(),
+        inner: Rc::clone(&inner),
     };
     let rx = Receiver {
         inner: inner,
