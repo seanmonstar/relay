@@ -20,7 +20,6 @@
 //! assert_eq!(rx.wait().unwrap(), "foo");
 //! # }
 //! ```
-#![deny(warnings)]
 #![deny(missing_docs)]
 #![deny(missing_debug_implementations)]
 extern crate futures;
