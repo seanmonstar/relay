@@ -1,9 +1,9 @@
 [package]
 name = "relay"
-version = "0.1.0"
+version = "0.1.1"
 description = "A lightweight oneshot Future channel."
 keywords = ["futures", "channel"]
-authors = ["Sean McArthur <sean.monstar@gmail.com>"]
+authors = ["Sean McArthur <sean@seanmonstar.com>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/seanmonstar/relay"
 documentation = "https://docs.rs/relay"
