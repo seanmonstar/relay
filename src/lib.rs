@@ -107,6 +107,34 @@ impl<T> Receiver<T> {
         let borrow = self.inner.borrow();
         borrow.complete && borrow.value.is_none()
     }
+
+    /// Tries to receive the value if completed.
+    ///
+    /// - Ok(Some(T)): Success.
+    /// - Ok(None): Not ready yet.
+    /// - Err(Canceled): The sender dropped without sending a value.
+    ///
+    /// It is safe to call this when not in a futures task context.
+    pub fn try_recv(&mut self) -> Result<Option<T>, Canceled> {
+        self.recv_inner(false)
+    }
+
+    fn recv_inner(&mut self, should_park: bool) -> Result<Option<T>, Canceled> {
+        let mut borrow = self.inner.borrow_mut();
+        if let Some(val) = borrow.value.take() {
+            Ok(Some(val))
+        } else if borrow.complete {
+            Err(Canceled)
+        } else {
+            if should_park {
+                borrow.rx_task = Some(task::current());
+            }
+            if let Some(task) = borrow.tx_task.take() {
+                task.notify();
+            }
+            Ok(None)
+        }
+    }
 }
 
 impl<T> Future for Receiver<T> {
@@ -114,18 +142,10 @@ impl<T> Future for Receiver<T> {
     type Error = Canceled;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        let mut borrow = self.inner.borrow_mut();
-        if let Some(val) = borrow.value.take() {
-            Ok(Async::Ready(val))
-        } else if borrow.complete {
-            Err(Canceled)
-        } else {
-            borrow.rx_task = Some(task::current());
-            if let Some(task) = borrow.tx_task.take() {
-                task.notify();
-            }
-            Ok(Async::NotReady)
-        }
+        self.recv_inner(true).map(|opt| match opt {
+            Some(t) => Async::Ready(t),
+            None => Async::NotReady,
+        })
     }
 }
 
@@ -267,5 +287,33 @@ mod tests {
             Ok(())
         }));
         assert_eq!(res.wait().unwrap_err(), super::Canceled);
+    }
+
+    #[test]
+    fn try_recv() {
+        let (tx, mut rx) = channel::<i32>();
+
+        assert!(rx.try_recv().unwrap().is_none());
+
+        ::futures::lazy(move || {
+            tx.complete(5);
+            Ok::<(), ()>(())
+        }).wait().unwrap();
+
+        assert_eq!(rx.try_recv().unwrap(), Some(5));
+    }
+
+    #[test]
+    fn try_recv_canceled() {
+        let (tx, mut rx) = channel::<i32>();
+
+        assert!(rx.try_recv().unwrap().is_none());
+
+        ::futures::lazy(move || {
+            let _tx = tx;
+            Ok::<(), ()>(())
+        }).wait().unwrap();
+
+        assert!(rx.try_recv().is_err());
     }
 }
