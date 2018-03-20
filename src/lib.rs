@@ -13,11 +13,11 @@
 //! ```rust
 //! # extern crate futures;
 //! # extern crate relay;
-//! # use futures::Future;
+//! # use futures::executor::block_on;
 //! # fn main() {
 //! let (tx, rx) = relay::channel();
 //! tx.complete("foo");
-//! assert_eq!(rx.wait().unwrap(), "foo");
+//! assert_eq!(block_on(rx).unwrap(), "foo");
 //! # }
 //! ```
 #![deny(warnings)]
@@ -30,15 +30,15 @@ use std::fmt;
 use std::rc::Rc;
 
 use futures::{Future, Poll, Async};
-use futures::task::{self, Task};
+use futures::task::{self, Waker};
 
 /// Create a new channel to send a message.
 pub fn channel<T>() -> (Sender<T>, Receiver<T>) {
     let inner = Rc::new(RefCell::new(Inner {
         value: None,
         complete: false,
-        tx_task: None,
-        rx_task: None,
+        tx_waker: None,
+        rx_waker: None,
     }));
     let tx = Sender {
         inner: inner.clone(),
@@ -76,14 +76,14 @@ impl<T> Sender<T> {
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
-        let rx_task = {
+        let rx_waker = {
             let mut borrow = self.inner.borrow_mut();
             borrow.complete = true;
-            borrow.tx_task.take();
-            borrow.rx_task.take()
+            borrow.tx_waker.take();
+            borrow.rx_waker.take()
         };
-        if let Some(task) = rx_task {
-            task.notify();
+        if let Some(waker) = rx_waker {
+            waker.wake();
         }
     }
 }
@@ -116,21 +116,21 @@ impl<T> Receiver<T> {
     ///
     /// It is safe to call this when not in a futures task context.
     pub fn try_recv(&mut self) -> Result<Option<T>, Canceled> {
-        self.recv_inner(false)
+        self.recv_inner(None)
     }
 
-    fn recv_inner(&mut self, should_park: bool) -> Result<Option<T>, Canceled> {
+    fn recv_inner(&mut self, opt_cx: Option<&mut task::Context>) -> Result<Option<T>, Canceled> {
         let mut borrow = self.inner.borrow_mut();
         if let Some(val) = borrow.value.take() {
             Ok(Some(val))
         } else if borrow.complete {
             Err(Canceled)
         } else {
-            if should_park {
-                borrow.rx_task = Some(task::current());
+            if let Some(cx) = opt_cx {
+                borrow.rx_waker = Some(cx.waker());
             }
-            if let Some(task) = borrow.tx_task.take() {
-                task.notify();
+            if let Some(waker) = borrow.tx_waker.take() {
+                waker.wake();
             }
             Ok(None)
         }
@@ -141,24 +141,24 @@ impl<T> Future for Receiver<T> {
     type Item = T;
     type Error = Canceled;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.recv_inner(true).map(|opt| match opt {
+    fn poll(&mut self, cx: &mut task::Context) -> Poll<Self::Item, Self::Error> {
+        self.recv_inner(Some(cx)).map(|opt| match opt {
             Some(t) => Async::Ready(t),
-            None => Async::NotReady,
+            None => Async::Pending,
         })
     }
 }
 
 impl<T> Drop for Receiver<T> {
     fn drop(&mut self) {
-        let tx_task = {
+        let tx_waker = {
             let mut borrow = self.inner.borrow_mut();
             borrow.complete = true;
-            borrow.rx_task.take();
-            borrow.tx_task.take()
+            borrow.rx_waker.take();
+            borrow.tx_waker.take()
         };
-        if let Some(task) = tx_task {
-            task.notify();
+        if let Some(waker) = tx_waker {
+            waker.wake();
         }
     }
 }
@@ -178,14 +178,14 @@ impl<T> Future for Waiting<T> {
     type Item = Sender<T>;
     type Error = Canceled;
 
-    fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
+    fn poll(&mut self, cx: &mut task::Context) -> Poll<Self::Item, Self::Error> {
         if self.tx.as_ref().unwrap().is_canceled() {
             Err(Canceled)
-        } else if self.tx.as_ref().unwrap().inner.borrow().rx_task.is_some() {
+        } else if self.tx.as_ref().unwrap().inner.borrow().rx_waker.is_some() {
             Ok(Async::Ready(self.tx.take().unwrap()))
         } else {
-            self.tx.as_ref().unwrap().inner.borrow_mut().tx_task = Some(task::current());
-            Ok(Async::NotReady)
+            self.tx.as_ref().unwrap().inner.borrow_mut().tx_waker = Some(cx.waker());
+            Ok(Async::Pending)
         }
     }
 }
@@ -203,26 +203,28 @@ pub struct Canceled;
 struct Inner<T> {
     value: Option<T>,
     complete: bool,
-    tx_task: Option<Task>,
-    rx_task: Option<Task>,
+    tx_waker: Option<Waker>,
+    rx_waker: Option<Waker>,
 }
 
 #[cfg(test)]
 mod tests {
-    use futures::Future;
+    use futures::{Async, Future, FutureExt};
+    use futures::future::{poll_fn, lazy};
+    use futures::executor::block_on;
     use super::channel;
 
     #[test]
     fn test_smoke() {
         let (tx, rx) = channel();
         tx.complete(33);
-        assert_eq!(rx.wait().unwrap(), 33);
+        assert_eq!(block_on(rx).unwrap(), 33);
     }
 
     #[test]
     fn test_canceled() {
         let (_, rx) = channel::<()>();
-        assert_eq!(rx.wait().unwrap_err(), super::Canceled);
+        assert_eq!(block_on(rx).unwrap_err(), super::Canceled);
     }
 
     #[test]
@@ -245,48 +247,49 @@ mod tests {
     fn test_tx_complete_rx_unparked() {
         let (tx, rx) = channel();
 
-        let res = rx.join(::futures::lazy(move || {
+        let res = rx.join(lazy(move || {
             tx.complete(55);
             Ok(11)
         }));
-        assert_eq!(res.wait().unwrap(), (55, 11));
+        assert_eq!(block_on(res).unwrap(), (55, 11));
     }
 
     #[test]
     fn test_tx_dropped_rx_unparked() {
         let (tx, rx) = channel::<i32>();
 
-        let res = rx.join(::futures::lazy(move || {
+        let res = rx.join(lazy(move || {
             let _tx = tx;
             Ok(11)
         }));
-        assert_eq!(res.wait().unwrap_err(), super::Canceled);
+        assert_eq!(block_on(res).unwrap_err(), super::Canceled);
     }
 
     #[test]
     fn test_waiting_unparked() {
         let (tx, rx) = channel::<i32>();
 
-        let res = tx.waiting().join(::futures::lazy(move || {
-            let mut rx = rx;
-            let _ = rx.poll(); // unpark
-            Ok(rx)
+        let mut rxo = Some(rx);
+        let res = tx.waiting().join(poll_fn(move |cx| {
+            let mut rx = rxo.take().unwrap();
+            let _ = rx.poll(cx); // unpark
+            Ok(Async::Ready(rx))
         })).and_then(|(tx, rx)| {
             tx.complete(5);
             rx
         });
-        assert_eq!(res.wait().unwrap(), 5);
+        assert_eq!(block_on(res).unwrap(), 5);
     }
 
     #[test]
     fn test_waiting_canceled() {
         let (tx, rx) = channel::<i32>();
 
-        let res = tx.waiting().join(::futures::lazy(move || {
+        let res = tx.waiting().join(lazy(move || {
             let _rx = rx;
             Ok(())
         }));
-        assert_eq!(res.wait().unwrap_err(), super::Canceled);
+        assert_eq!(block_on(res).unwrap_err(), super::Canceled);
     }
 
     #[test]
@@ -295,10 +298,10 @@ mod tests {
 
         assert!(rx.try_recv().unwrap().is_none());
 
-        ::futures::lazy(move || {
+        block_on(lazy(move || {
             tx.complete(5);
             Ok::<(), ()>(())
-        }).wait().unwrap();
+        })).unwrap();
 
         assert_eq!(rx.try_recv().unwrap(), Some(5));
     }
@@ -309,10 +312,10 @@ mod tests {
 
         assert!(rx.try_recv().unwrap().is_none());
 
-        ::futures::lazy(move || {
+        block_on(lazy(move || {
             let _tx = tx;
             Ok::<(), ()>(())
-        }).wait().unwrap();
+        })).unwrap();
 
         assert!(rx.try_recv().is_err());
     }

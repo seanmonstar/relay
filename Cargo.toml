@@ -9,4 +9,4 @@ repository = "https://github.com/seanmonstar/relay"
 documentation = "https://docs.rs/relay"
 
 [dependencies]
-futures = "0.1"
+futures = "0.2.0-alpha"
